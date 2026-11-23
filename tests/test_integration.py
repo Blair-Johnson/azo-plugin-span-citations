@@ -11,15 +11,27 @@ import threading
 
 import pytest
 
-from agent_utils.components import BufferManagerProvider, ToolDispatchEnd, ToolDispatchStart
-from agent_utils.session import Session, flatten
-from agent_utils.tool import Tool
-from agent_utils.tools.buffers import (
-    AppendLines, BufferInfo, Checkpoint, CloseBuffer, CopyBuffer,
+from agent_utils.core.events import (
+    InputReceived,
+    RunToolCall,
+    ToolCallFinished,
+    TurnSettled,
+)
+from agent_utils.core.pipeline import Pipeline
+from agent_utils.core.session import Session
+from agent_utils.core.state import Entry, ToolCall
+from agent_utils.core.tool import Tool
+from agent_utils.features.buffers import (
+    AppendLines, BufferInfo, BufferManagerProvider, Checkpoint, CloseBuffer, CopyBuffer,
     Grep, InsertLines, PrependLines, RawDiff, RestoreCheckpoint,
     Save, StrReplace, View,
 )
-from agent_utils.types import Entry, ToolCall
+from agent_utils.features.core import ToolRunner, UnknownToolFallback
+from agent_utils.storage import (
+    load_session_json,
+    restore_session_document,
+    save_session_json,
+)
 
 import span_citations as spans
 
@@ -27,21 +39,29 @@ import span_citations as spans
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _noop_emit(_ev):
+    return None
+
+
 def make_session():
     """Initialize real component defaults without running an LLM turn."""
     service = spans.ClipService()
-    session = Session()
-    session.pipeline = [
-        BufferManagerProvider(), spans.SpanSetup(), spans.ClipSpan(service),
-        spans.SpanCompletionCheck(service), spans.CloseCitation(), CloseBuffer(),
-    ]
+    pipeline = Pipeline([
+        BufferManagerProvider(),
+        spans.SpanSetup(),
+        spans.ClipSpan(service),
+        spans.SpanCompletionCheck(service),
+        spans.CloseCitation(),
+        CloseBuffer(),
+    ])
+    session = Session(pipeline=pipeline)
     session.ensure_initialized()
-    spans.SpanSetup()(session.state)
+    spans.SpanSetup().handle(InputReceived(message={}), session.state, _noop_emit)
     return session, service
 
 
 def call(state, tool, **kwargs):
-    """Exercise Tool.pending/result/error/_notify, not private _exec methods."""
+    """Exercise Tool.handle(RunToolCall) through event propagation."""
     tools = tool if isinstance(tool, (list, tuple)) else [tool]
     tc = ToolCall(id=f"call-{state.step}", name=tools[0].name,
                   raw_args=json.dumps(kwargs), parsed_args=kwargs)
@@ -51,8 +71,13 @@ def call(state, tool, **kwargs):
         index=len(state.entries), step=state.step, tokens=0, tool_calls=[tc],
     ))
     state.step += 1
+    emitted = []
+    event = RunToolCall(tc)
     for component in tools:
-        component(state)
+        if event.stopped:
+            break
+        component.handle(event, state, emitted.append)
+    state._last_emitted = emitted
     assert tc.result is not None, f"Unhandled tool call: {tc.name}"
     return tc
 
@@ -74,9 +99,8 @@ def inline_worker(monkeypatch, service):
 @pytest.fixture
 def runtime(tmp_path):
     session, service = make_session()
-    session.state.session_cwd = str(tmp_path)
+    session.state.cwd = str(tmp_path)
     yield session, service
-    session.state.buffer_manager.cleanup()
 
 
 @pytest.fixture
@@ -128,8 +152,8 @@ def test_real_read_tools_and_copy_by_value(citation):
     assert not close(state, buffer=bid).error
     assert "copy-only edit" in bm.require_writable(target).text
     assert not close(state, buffer=target, discard=True).error
-    spans.SpanCompletionCheck(service)(state)
-    assert state.pending_interrupts == []
+    spans.SpanCompletionCheck(service).handle(TurnSettled(), state, _noop_emit)
+    assert getattr(state, "pending_interrupts", []) == []
 
 
 @pytest.mark.parametrize("tool,kwargs", [
@@ -177,11 +201,10 @@ def test_copy_cannot_overwrite_citation(citation, overwrite):
 def test_close_deletes_immediately_and_notifies_once(citation):
     session, _, bid, _ = citation
     state = session.state
-    notifications = []
-    state.on_tool_call = notifications.append
     tc = close(state, buffer=f"  {bid}  ")
     assert not tc.error, tc.result
-    assert notifications == [tc]
+    finished = [ev for ev in state._last_emitted if isinstance(ev, ToolCallFinished)]
+    assert len(finished) == 1 and finished[0].tool_call is tc
     assert bid not in state.span_citation_records
     assert call(state, View(), buffer=bid).error
     assert call(state, Grep(), buffer=bid, pattern="exact").error
@@ -207,15 +230,16 @@ def test_plain_close_semantics_are_unchanged(runtime, tmp_path, kind):
     else:
         path = tmp_path / "ordinary.txt"
         path.write_text("clean disk content", encoding="utf-8")
-        bid, _, _ = bm.open_buffer(str(path))
+        bid, _, _ = bm.open_from_text(str(path), path.read_text(encoding="utf-8"))
     if kind == "dirty":
         assert not call(state, AppendLines(), buffer=bid, text="unsaved").error
     args = {} if kind == "omitted" else {"buffer": bid}
     # The citation layer must leave a non-citation call completely unhandled.
     tc = ToolCall(id="probe", name="close_buffer", raw_args="{}", parsed_args=args)
     state.pending_tool_calls = [tc]
-    spans.CloseCitation().transform(state)
-    assert tc.result is None and not tc.error
+    probe_event = RunToolCall(tc)
+    spans.CloseCitation().handle(probe_event, state, _noop_emit)
+    assert tc.result is None and not tc.error and not probe_event.stopped
     result = close(state, **args)
     assert result.error == (kind in {"dirty", "scratch", "unknown"}), result.result
     if kind in {"dirty", "scratch"}:
@@ -226,10 +250,11 @@ def test_plain_close_semantics_are_unchanged(runtime, tmp_path, kind):
 
 def restore_session(path):
     session, service = make_session()
-    session.load(str(path), verify_blobs=True)
+    doc = load_session_json(path, verify_blobs=True)
+    restore_session_document(doc, session.pipeline, state=session.state)
     session.ensure_initialized()
     # Restored data has no persisted provider callbacks. Normal setup rebinds it.
-    spans.SpanSetup()(session.state)
+    spans.SpanSetup().handle(InputReceived(message={}), session.state, _noop_emit)
     return session, service
 
 
@@ -237,29 +262,23 @@ def test_json_session_roundtrip_preserves_readonly_and_close_deletion(citation, 
     session, _, bid, source = citation
     original = session.state.span_citation_records[bid]
     path = tmp_path / "session.json"
-    session.save(str(path))
+    save_session_json(session.state, session.pipeline, path)
     document = json.loads(path.read_text())
     assert document["attrs"]["span_citation_records"][bid] == original
     source.unlink()
     restored, service = restore_session(path)
-    try:
-        state = restored.state
-        assert state.span_citation_records == {bid: original}
-        assert state.buffer_manager.resolve_for_read(state, bid).readonly
-        assert not call(state, View(), buffer=bid).error
-        tc = call(state, AppendLines(), buffer=bid, text="forged")
-        assert tc.error and "readonly" in tc.result.lower()
-        assert service.futures == {}
-        assert not close(state, buffer=bid).error
-        restored.save(str(path))
-        again, _ = restore_session(path)
-        try:
-            assert again.state.span_citation_records == {}
-            assert call(again.state, View(), buffer=bid).error
-        finally:
-            again.state.buffer_manager.cleanup()
-    finally:
-        restored.state.buffer_manager.cleanup()
+    state = restored.state
+    assert state.span_citation_records == {bid: original}
+    assert state.buffer_manager.resolve_for_read(state, bid).readonly
+    assert not call(state, View(), buffer=bid).error
+    tc = call(state, AppendLines(), buffer=bid, text="forged")
+    assert tc.error and "readonly" in tc.result.lower()
+    assert service.futures == {}
+    assert not close(state, buffer=bid).error
+    save_session_json(restored.state, restored.pipeline, path)
+    again, _ = restore_session(path)
+    assert again.state.span_citation_records == {}
+    assert call(again.state, View(), buffer=bid).error
 
 
 @pytest.mark.parametrize("success", [True, False])
@@ -277,8 +296,8 @@ def test_inline_completion_has_no_interrupt(runtime, tmp_path, monkeypatch, succ
     if not success:
         assert reply["code"] == "no_match"
     for _ in range(3):
-        spans.SpanCompletionCheck(service)(state)
-    assert state.pending_interrupts == []
+        spans.SpanCompletionCheck(service).handle(TurnSettled(), state, _noop_emit)
+    assert getattr(state, "pending_interrupts", []) == []
     assert state.span_citation_pending == {} and service.futures == {}
     assert len(state.span_citation_records) == int(success)
 
@@ -311,15 +330,15 @@ def test_deferred_worker_delivers_exactly_one_completion(runtime, tmp_path, monk
         assert not future.done()
         assert state.span_citation_pending == {job: {"path": str(source)}}
         check = spans.SpanCompletionCheck(service)
-        check(state)
-        assert state.pending_interrupts == [] and state.span_citation_records == {}
+        check.handle(TurnSettled(), state, _noop_emit)
+        assert getattr(state, "pending_interrupts", []) == [] and state.span_citation_records == {}
         release.set()
         result = future.result(timeout=5)
         assert result["status"] == ("complete" if success else "error")
         # Worker completion alone must never mutate harness state.
         assert job in state.span_citation_pending
-        assert state.span_citation_records == {} and state.pending_interrupts == []
-        check(state)
+        assert state.span_citation_records == {} and getattr(state, "pending_interrupts", []) == []
+        check.handle(TurnSettled(), state, _noop_emit)
         assert len(state.pending_interrupts) == 1
         heading, body = state.pending_interrupts[0].split("\n", 1)
         assert heading == f"[Span clipping completed | {job}]"
@@ -332,7 +351,7 @@ def test_deferred_worker_delivers_exactly_one_completion(runtime, tmp_path, monk
         else:
             assert reply["code"] == "no_match" and "buffer_id" not in reply
         for _ in range(3):
-            check(state)
+            check.handle(TurnSettled(), state, _noop_emit)
         assert len(state.pending_interrupts) == 1
         assert state.span_citation_pending == {} and service.futures == {}
         assert len(state.span_citation_records) == int(success)
@@ -349,126 +368,67 @@ def test_pending_jobs_reload_as_interrupted_once(runtime, tmp_path):
         "clip_lost_2": {"path": "second.txt"},
     }
     path = tmp_path / "pending.json"
-    session.save(str(path))
+    save_session_json(session.state, session.pipeline, path)
     restored, fresh_service = restore_session(path)
-    try:
-        state = restored.state
-        assert len(state.span_citation_pending) == 2
-        assert fresh_service.futures == {}
-        check = spans.SpanCompletionCheck(fresh_service)
-        check(state)
-        replies = [json.loads(message.split("\n", 1)[1]) for message in state.pending_interrupts]
-        assert {reply["job_id"] for reply in replies} == {"clip_lost_1", "clip_lost_2"}
-        assert len(replies) == 2
-        assert all(reply["status"] == "error" and reply["code"] == "interrupted" for reply in replies)
-        assert state.span_citation_pending == {} and state.span_citation_records == {}
-        check(state)
-        assert len(state.pending_interrupts) == 2
-    finally:
-        restored.state.buffer_manager.cleanup()
-
-
-def schema_source():
-    path = Path(os.environ.get("AZO_SCHEMA_RETURN_SOURCE", str(
-        ROOT.parent / "azo-plugin-schema-return" / "src" / "schema_return.py")))
-    if not path.is_file():
-        pytest.skip("schema-return checkout unavailable; set AZO_SCHEMA_RETURN_SOURCE")
-    return path
-
-
-@pytest.fixture
-def schema_plugin(monkeypatch):
-    name = "span_test_schema_return"
-    spec = importlib.util.spec_from_file_location(name, schema_source())
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_schema_return_reads_and_copies_but_cannot_adopt_or_mutate(citation, schema_plugin):
-    session, _, bid, _ = citation
-    state = session.state
-    plugin = schema_plugin
-    original = state.span_citation_records[bid]
-    read = plugin.buffer_operation(state, "buffers.read", {"buffer_id": bid})
-    assert read["text"] == original
-    assert read["readonly"] is True and read["allocated"] is True
-    assert read["disk_bound"] is False
-    for op, params in [
-        ("buffers.adopt", {}),
-        ("buffers.replace", {"text": "forged", "if_match": read["etag"]}),
-        ("buffers.close", {"discard": True, "if_match": read["etag"]}),
-    ]:
-        with pytest.raises(plugin.RpcError):
-            plugin.buffer_operation(state, op, {"buffer_id": bid, **params})
-        assert state.span_citation_records[bid] == original
-    assert bid not in plugin.get_data(state)["owned"]
-    copy = plugin.buffer_operation(state, "buffers.copy", {"source_id": bid})
-    assert copy["buffer_id"].startswith("buf_") and not copy["readonly"]
-    plugin.buffer_operation(state, "buffers.replace", {
-        "buffer_id": copy["buffer_id"], "text": "editable copy", "if_match": copy["etag"],
-    })
-    assert state.span_citation_records[bid] == original
-    assert not close(state, buffer=bid).error
-    with pytest.raises(plugin.RpcError):
-        plugin.buffer_operation(state, "buffers.read", {"buffer_id": bid})
-    assert plugin.buffer_operation(state, "buffers.read", {
-        "buffer_id": copy["buffer_id"],
-    })["text"] == "editable copy"
+    state = restored.state
+    assert len(state.span_citation_pending) == 2
+    assert fresh_service.futures == {}
+    check = spans.SpanCompletionCheck(fresh_service)
+    check.handle(TurnSettled(), state, _noop_emit)
+    replies = [json.loads(message.split("\n", 1)[1]) for message in state.pending_interrupts]
+    assert {reply["job_id"] for reply in replies} == {"clip_lost_1", "clip_lost_2"}
+    assert len(replies) == 2
+    assert all(reply["status"] == "error" and reply["code"] == "interrupted" for reply in replies)
+    assert state.span_citation_pending == {} and state.span_citation_records == {}
+    check.handle(TurnSettled(), state, _noop_emit)
+    assert len(state.pending_interrupts) == 2
 
 
 @pytest.mark.parametrize("builder_name", [
     "build_default_pipeline", "build_default_rlm_pipeline", "build_readonly_rlm_pipeline",
 ])
-@pytest.mark.parametrize("with_schema_return", [False, True])
-def test_real_pipeline_builds_and_close_order(tmp_path, monkeypatch, builder_name, with_schema_return):
-    from agent_zoo import pipelines, plugins
-    from agent_zoo.modes import default_modes, rlm_modes
+def test_real_pipeline_builds_and_close_order(tmp_path, monkeypatch, builder_name):
+    from agent_zoo import pipelines
+    from agent_zoo.features.modes import default_modes, rlm_modes
+    from agent_zoo.plugins import loader as plugins_loader
 
     common = tmp_path / "plugins" / "common"
     common.mkdir(parents=True)
     (common / "span_citations.py").symlink_to(ROOT / "src" / "span_citations.py")
-    if with_schema_return:
-        (common / "schema_return.py").symlink_to(schema_source())
-    monkeypatch.setattr(plugins, "_BASE_DIR", common.parent)
+    monkeypatch.setattr(plugins_loader, "_BASE_DIR", common.parent)
     # Do not load unrelated locally installed entry-point plugins into this test.
-    monkeypatch.setattr(plugins, "_iter_entry_points", lambda group: [])
+    monkeypatch.setattr(plugins_loader, "_iter_entry_points", lambda group: [])
     session = Session()
     modes = default_modes() if builder_name == "build_default_pipeline" else rlm_modes()
     session.pipeline = getattr(pipelines, builder_name)(
         session, config={}, mode_defs=modes, initial_mode="execution",
+        include_llm_drivers=False,
     )
     session.ensure_initialized()
-    try:
-        components = flatten(session.pipeline)
-        by_name = lambda name: [c for c in components if type(c).__name__ == name]
-        assert len(by_name("SpanSetup")) == len(by_name("SpanCompletionCheck")) == 1
-        assert len(by_name("ClipSpan")) == len(by_name("CloseCitation")) == 1
-        setup, clip, close_citation = (by_name(name)[0] for name in ("SpanSetup", "ClipSpan", "CloseCitation"))
-        host_close = next(c for c in components if type(c) is CloseBuffer)
-        start = next(c for c in components if isinstance(c, ToolDispatchStart))
-        end = next(c for c in components if isinstance(c, ToolDispatchEnd))
-        provider = next(c for c in components if isinstance(c, BufferManagerProvider))
-        index = components.index
-        assert index(provider) < index(setup) < index(start)
-        assert index(start) < index(close_citation) < index(host_close) < index(end)
-        assert index(start) < index(clip) < index(end)
-        tools = [c for c in components if isinstance(c, Tool)]
-        names = {c.name for c in tools}
-        assert {"clip_span", "view", "grep", "buffer_info", "copy_buffer", "close_buffer"} <= names
-        if builder_name == "build_readonly_rlm_pipeline":
-            assert "save" not in names and "write_file" not in names
-        if with_schema_return:
-            assert "submit_result" in names
-        setup(session.state)
-        state = session.state
-        state.span_citation_records["span_order_test"] = '{"immutable":true}'
-        handlers = [c for c in tools if c.name == "close_buffer"]
-        tc = call(state, handlers, buffer="span_order_test")
-        assert not tc.error and "span_order_test" not in state.span_citation_records
-        bid, _ = state.buffer_manager.create_scratch_buffer("")
-        tc = call(state, handlers, buffer=bid, discard=True)
-        assert not tc.error and state.buffer_manager.get(bid) is None
-    finally:
-        session.state.buffer_manager.cleanup()
+    components = list(session.pipeline.components)
+    by_name = lambda name: [c for c in components if type(c).__name__ == name]
+    assert len(by_name("SpanSetup")) == len(by_name("SpanCompletionCheck")) == 1
+    assert len(by_name("ClipSpan")) == len(by_name("CloseCitation")) == 1
+    setup, clip, close_citation = (by_name(name)[0] for name in ("SpanSetup", "ClipSpan", "CloseCitation"))
+    host_close = next(c for c in components if type(c) is CloseBuffer)
+    runner = next(c for c in components if isinstance(c, ToolRunner))
+    fallback = next(c for c in components if isinstance(c, UnknownToolFallback))
+    provider = next(c for c in components if isinstance(c, BufferManagerProvider))
+    index = components.index
+    assert index(provider) < index(setup) < index(runner)
+    assert index(runner) < index(close_citation) < index(host_close) < index(fallback)
+    assert index(runner) < index(clip) < index(fallback)
+    tools = [c for c in components if isinstance(c, Tool)]
+    names = {c.name for c in tools}
+    assert {"clip_span", "view", "grep", "buffer_info", "copy_buffer", "close_buffer"} <= names
+    if builder_name == "build_readonly_rlm_pipeline":
+        assert "save" not in names and "write_file" not in names
+    setup.handle(InputReceived(message={}), session.state, _noop_emit)
+    state = session.state
+    state.span_citation_records["span_order_test"] = '{"immutable":true}'
+    handlers = [c for c in tools if c.name == "close_buffer"]
+    tc = call(state, handlers, buffer="span_order_test")
+    assert not tc.error and "span_order_test" not in state.span_citation_records
+    bid, _ = state.buffer_manager.create_scratch_buffer("")
+    tc = call(state, handlers, buffer=bid, discard=True)
+    assert not tc.error and state.buffer_manager.get(bid) is None

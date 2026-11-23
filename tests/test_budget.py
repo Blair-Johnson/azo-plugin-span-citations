@@ -4,8 +4,14 @@ import time
 
 import pytest
 
+from agent_utils.core.events import TurnSettled
+
 import span_citations as spans
 from test_integration import call, make_session
+
+
+def _noop_emit(_ev):
+    return None
 
 
 def test_actual_half_second_budget_and_no_cancellation(monkeypatch):
@@ -24,7 +30,7 @@ def test_actual_half_second_budget_and_no_cancellation(monkeypatch):
     assert json.loads(tc.result)["status"] == "pending"
     assert not future.cancelled() and not future.done()
     future.set_result({"status": "error", "code": "no_match", "message": "not found"})
-    spans.SpanCompletionCheck(service)(session.state)
+    spans.SpanCompletionCheck(service).handle(TurnSettled(), session.state, _noop_emit)
     assert len(session.state.pending_interrupts) == 1
 
 

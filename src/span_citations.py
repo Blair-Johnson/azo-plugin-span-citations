@@ -14,12 +14,20 @@ import threading
 import time
 import uuid
 
-from agent_utils import Feature, Tool
-from agent_utils.components import (
-    BufferManagerProvider, HarnessEventHandler, InterruptCheck, ToolDispatchStart,
+from agent_utils.core.events import (
+    Event,
+    InputReceived,
+    RunToolCall,
+    ToolCallFinished,
+    TurnSettled,
 )
-from agent_utils.session_cwd import get_session_cwd
-from agent_utils.tools.buffers import CloseBuffer
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import State
+from agent_utils.core.tool import Tool
+from agent_utils.features.buffers import BufferManagerProvider, CloseBuffer
+from agent_utils.features.core import ToolRunner
+from agent_utils.features.interrupts import InterruptCheck
+from agent_zoo.events import SessionReady
 
 PREFIX = "span_"
 WAIT_SECONDS = 0.5
@@ -37,6 +45,16 @@ class ClipError(ValueError):
 
 def encode(value):
     return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+
+
+def _get_session_cwd(state: State) -> str:
+    cwd = str(
+        getattr(state, "cwd", "")
+        or getattr(state, "session_cwd", "")
+        or getattr(state, "terminal_cwd", "")
+        or ""
+    ).strip()
+    return cwd or os.getcwd()
 
 
 def _signature(info):
@@ -190,37 +208,37 @@ class ClipService:
 
 
 class SpanSetup:
+    handles = (InputReceived, RunToolCall, TurnSettled)
     reads = {"buffer_manager"}
     writes = {"span_citation_records", "span_citation_pending"}
     init = {"span_citation_records": dict, "span_citation_pending": dict, "span_citation_notices": dict}
 
-    def __call__(self, state):
-        bind_namespace(state)
-        return state
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if getattr(state, "buffer_manager", None) is not None:
+            bind_namespace(state)
 
 
-class SpanStartup(HarnessEventHandler):
-    event_kinds = {"runtime.session_ready"}
+class SpanStartup:
+    handles = (SessionReady,)
     optional_reads = {"buffer_manager"}
     init = SpanSetup.init
 
-    def handle_harness_event(self, event, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if getattr(state, "buffer_manager", None) is not None:
             bind_namespace(state)
-        return None
+
 
 class ClipSpan(Tool):
     reads = {"buffer_manager", "span_citation_records", "span_citation_pending"}
     writes = {"span_citation_records", "span_citation_pending"}
-    optional_reads = {"session_cwd", "terminal_cwd"}
+    optional_reads = {"cwd", "session_cwd", "terminal_cwd"}
     group = "Span citations"
 
     def __init__(self, service):
         super().__init__()
         self.service = service
 
-    @staticmethod
-    def fn(path: str, prefix: str, suffix: str) -> str:
+    def call(self, state: State, path: str, prefix: str, suffix: str) -> str:
         """Clip an exact, uniquely anchored span from a UTF-8 file into immutable JSON.
 
         Includes both anchors, preserving all source bytes and whitespace. Anchors
@@ -236,6 +254,7 @@ class ClipSpan(Tool):
             prefix: Nonempty exact string at the beginning of the desired span.
             suffix: Nonempty exact string at the end of the desired span.
         """
+        return encode(self.execute(state, path, prefix, suffix))
 
     def execute(self, state, path, prefix, suffix):
         deadline = time.monotonic() + WAIT_SECONDS
@@ -250,7 +269,7 @@ class ClipSpan(Tool):
             raise ClipError("busy", "Four clip jobs are outstanding; wait for their completion interrupts.")
         bind_namespace(state)
         job_id = "clip_" + uuid.uuid4().hex
-        future = self.service.start(job_id, path, prefix, suffix, get_session_cwd(state))
+        future = self.service.start(job_id, path, prefix, suffix, _get_session_cwd(state))
         state.span_citation_pending[job_id] = {"path": path}
         try:
             result = future.result(timeout=max(0, deadline - time.monotonic()))
@@ -259,23 +278,38 @@ class ClipSpan(Tool):
                     "message": "Clipping continues in the background; completion will arrive as an interrupt."}
         return self.service.finish(state, job_id, result)
 
-    def transform(self, state):
-        for tc, kwargs in self.pending(state):
-            try:
-                result = self.execute(state, **kwargs)
-            except (ClipError, UnicodeError, TypeError) as exc:
-                result = {"status": "error", "code": getattr(exc, "code", "invalid_params"), "message": str(exc)}
-            except Exception as exc:
-                result = {"status": "error", "code": "internal_error", "message": f"{type(exc).__name__}: {exc}"}
-            tc.result = encode(result)
-            tc.error = result["status"] == "error"
-            self._notify(state, tc)
-        return state
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, RunToolCall):
+            return
+        tc = event.tool_call
+        if tc.name != self.name:
+            return
+        event.stop()
+        if tc.started_at is None:
+            tc.started_at = event.ts
+        if not self.available(state):
+            tc.result = f"ERROR: {self.name} is not currently available."
+            tc.error = True
+            tc.finished_at = event.ts
+            emit(ToolCallFinished(tc))
+            return
+        try:
+            result = self.execute(state, **tc.parsed_args)
+        except (ClipError, UnicodeError, TypeError) as exc:
+            result = {"status": "error", "code": getattr(exc, "code", "invalid_params"), "message": str(exc)}
+        except Exception as exc:
+            result = {"status": "error", "code": "internal_error", "message": f"{type(exc).__name__}: {exc}"}
+        tc.result = encode(result)
+        tc.error = result["status"] == "error"
+        tc.finished_at = event.ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
 
 
 class SpanCompletionCheck(InterruptCheck):
     check_name = "span_citation_completion"
     cooldown = 0
+    handles = (TurnSettled,)
     optional_reads = {"buffer_manager", "span_citation_pending", "span_citation_records", "entries"}
     writes = {"span_citation_pending", "span_citation_records", "span_citation_notices"}
     init = {"span_citation_notices": dict}
@@ -283,10 +317,14 @@ class SpanCompletionCheck(InterruptCheck):
     def __init__(self, service):
         self.service = service
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, TurnSettled):
+            return
         if getattr(state, "buffer_manager", None) is None:
-            return state
+            return
         bind_namespace(state)
+        if not hasattr(state, "span_citation_notices") or state.span_citation_notices is None:
+            state.span_citation_notices = {}
         for job_id in list(getattr(state, "span_citation_pending", {})):
             future = self.service.futures.get(job_id)
             if future is not None and not future.done():
@@ -311,7 +349,6 @@ class SpanCompletionCheck(InterruptCheck):
             elif job_id not in self.service.enqueued:
                 self._fire(state, notice)
                 self.service.enqueued.add(job_id)
-        return state
 
 
 class CloseCitation(Tool):
@@ -322,19 +359,29 @@ class CloseCitation(Tool):
     reads = {"span_citation_records"}
     writes = {"span_citation_records"}
 
-    def transform(self, state):
-        for tc, kwargs in self.pending(state):
-            buffer_id = kwargs.get("buffer", "")
-            if not isinstance(buffer_id, str) or not buffer_id.strip().startswith(PREFIX):
-                continue
-            buffer_id = buffer_id.strip()
-            if buffer_id not in state.span_citation_records:
-                tc.result, tc.error = f"ERROR: No citation buffer '{buffer_id}'.", True
-            else:
-                del state.span_citation_records[buffer_id]
-                tc.result = f"Closed citation buffer {buffer_id}."
-            self._notify(state, tc)
-        return state
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, RunToolCall):
+            return
+        tc = event.tool_call
+        if tc.name != self.name:
+            return
+        buffer_id = tc.parsed_args.get("buffer", "")
+        if not isinstance(buffer_id, str) or not buffer_id.strip().startswith(PREFIX):
+            return
+        event.stop()
+        if tc.started_at is None:
+            tc.started_at = event.ts
+        buffer_id = buffer_id.strip()
+        if buffer_id not in state.span_citation_records:
+            tc.result = f"ERROR: No citation buffer '{buffer_id}'."
+            tc.error = True
+        else:
+            del state.span_citation_records[buffer_id]
+            tc.result = f"Closed citation buffer {buffer_id}."
+            tc.error = False
+        tc.finished_at = event.ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
 
 
 def register_features(builder, *, session, config):
@@ -342,5 +389,5 @@ def register_features(builder, *, session, config):
     builder.add(Feature(
         name="span_citations",
         components=[SpanSetup(), SpanStartup(), ClipSpan(service), SpanCompletionCheck(service), CloseCitation()],
-        order=[HarnessEventHandler, BufferManagerProvider, SpanSetup, ToolDispatchStart, CloseCitation, CloseBuffer],
+        order=[BufferManagerProvider, {SpanSetup, SpanStartup}, ToolRunner, CloseCitation, CloseBuffer],
     ))
