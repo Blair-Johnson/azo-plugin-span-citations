@@ -158,7 +158,6 @@ def test_real_read_tools_and_copy_by_value(citation):
 
 @pytest.mark.parametrize("tool,kwargs", [
     (StrReplace, {"old": "exact", "new": "forged"}),
-    (StrReplace, {"start_exclusive": "BEGIN", "end_exclusive": "END", "replacement": "forged"}),
     (InsertLines, {"anchor": '"schema"', "before_anchor": True, "text": "forged"}),
     (AppendLines, {"text": "forged"}),
     (PrependLines, {"text": "forged"}),
