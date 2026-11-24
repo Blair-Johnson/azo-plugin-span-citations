@@ -421,12 +421,13 @@ def test_real_pipeline_builds_and_close_order(tmp_path, monkeypatch, builder_nam
     tools = [c for c in components if isinstance(c, Tool)]
     names = {c.name for c in tools}
     assert {"clip_span", "view", "grep", "buffer_info", "copy_buffer", "close_buffer"} <= names
+    assert sum(1 for c in tools if c.name == "close_buffer") == 1
     if builder_name == "build_readonly_rlm_pipeline":
         assert "save" not in names and "write_file" not in names
     setup.handle(InputReceived(message={}), session.state, _noop_emit)
     state = session.state
     state.span_citation_records["span_order_test"] = '{"immutable":true}'
-    handlers = [c for c in tools if c.name == "close_buffer"]
+    handlers = [c for c in components if getattr(c, "name", None) == "close_buffer"]
     tc = call(state, handlers, buffer="span_order_test")
     assert not tc.error and "span_order_test" not in state.span_citation_records
     bid, _ = state.buffer_manager.create_scratch_buffer("")

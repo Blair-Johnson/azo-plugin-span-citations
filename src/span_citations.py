@@ -351,11 +351,10 @@ class SpanCompletionCheck(InterruptCheck):
                 self.service.enqueued.add(job_id)
 
 
-class CloseCitation(Tool):
-    """Layer only citation IDs ahead of the ordinary close_buffer handler."""
+class CloseCitation:
+    """Intercept close_buffer calls for span_* citation IDs ahead of CloseBuffer."""
+    handles = (RunToolCall,)
     name = "close_buffer"
-    schema = CloseBuffer.schema
-    description = CloseBuffer.description
     reads = {"span_citation_records"}
     writes = {"span_citation_records"}
 
