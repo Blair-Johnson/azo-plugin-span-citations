@@ -40,10 +40,11 @@ def test_buffered_notice_recovers_after_reload():
     bid = completed(session, service)
     delivery = InterruptDelivery()
     delivery.handle(TurnSettled(), session.state, _noop_emit)
-    assert session.state.pending_interrupts == []
-    assert len(delivery._buffered) == 1
+    assert len(session.state.pending_interrupts) == 1
+    assert len(session.state.entries) == 1
     reloaded, new_service = restored(session)
     state = reloaded.state
+    assert state.pending_interrupts == []
     assert state.buffer_manager.resolve_for_read(state, bid).text == '{"snapshot": true}'
     check = spans.SpanCompletionCheck(new_service)
     check.handle(TurnSettled(), state, _noop_emit)

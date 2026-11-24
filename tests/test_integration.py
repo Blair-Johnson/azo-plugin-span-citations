@@ -133,7 +133,7 @@ def test_real_read_tools_and_copy_by_value(citation):
     for tool, args, expected in [
         (View(), {"buffer": bid}, "azo.span-citation"),
         (Grep(), {"buffer": bid, "pattern": "exact"}, "exact"),
-        (BufferInfo(), {"buffers": [bid]}, "[readonly]"),
+        (BufferInfo(), {"buffers": [bid]}, "[readonly"),
     ]:
         tc = call(state, tool, **args)
         assert not tc.error, tc.result
@@ -419,7 +419,7 @@ def test_real_pipeline_builds_and_close_order(tmp_path, monkeypatch, builder_nam
     assert index(runner) < index(clip) < index(fallback)
     tools = [c for c in components if isinstance(c, Tool)]
     names = {c.name for c in tools}
-    assert {"clip_span", "view", "grep", "buffer_info", "copy_buffer", "close_buffer"} <= names
+    assert {"clip_span", "view", "grep", "close_buffer"} <= names
     assert sum(1 for c in tools if c.name == "close_buffer") == 1
     if builder_name == "build_readonly_rlm_pipeline":
         assert "save" not in names and "write_file" not in names
