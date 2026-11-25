@@ -1,9 +1,10 @@
-"""Exact, immutable file-span citations for Agent Zoo (stdlib-only)."""
+"""Exact, immutable file-span citations for Agent Zoo (stdlib-only, strict Sans-I/O)."""
 from __future__ import annotations
 
 import codecs
 from collections import deque
-from concurrent.futures import Future, TimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -11,25 +12,35 @@ from pathlib import Path
 import stat
 import tempfile
 import threading
-import time
+from typing import Any
 import uuid
 
 from agent_utils.core.events import (
     Event,
     InputReceived,
+    InterruptRequested,
+    IoCompleted,
+    IoFailed,
+    IoInterrupted,
     RunToolCall,
+    SessionRestored,
+    TimerFired,
     ToolCallFinished,
     TurnSettled,
 )
+from agent_utils.core.io import IoRequest, OpId, StartTimer
 from agent_utils.core.pipeline import EmitFn, Feature
-from agent_utils.core.state import State
+from agent_utils.core.state import DurableSpec, State, ToolCall
 from agent_utils.core.tool import Tool
 from agent_utils.features.buffers import BufferManagerProvider, CloseBuffer
-from agent_utils.features.core import ToolRunner
+from agent_utils.features.core import IoFence, ToolRunner
 from agent_utils.features.interrupts import InterruptCheck
+from agent_utils.runtime.driver import Driver
 from agent_zoo.events import SessionReady
 
 PREFIX = "span_"
+DURABLE_KEY = "span_citations"
+RUNTIME_KEY = "span_citations"
 WAIT_SECONDS = 0.5
 CHUNK_BYTES = 1024 * 1024
 MAX_ANCHOR_BYTES = 64 * 1024
@@ -38,30 +49,98 @@ MAX_PENDING = 4
 
 
 class ClipError(ValueError):
-    def __init__(self, code, message):
+    def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
 
 
-def encode(value):
+def encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
 
 
+# ---------------------------------------------------------------------------
+# Typed IO request, durable state, and ephemeral runtime state
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClipSpanRequest(IoRequest):
+    """Read and anchor-match an exact UTF-8 file span on a driver worker thread."""
+
+    job_id: str
+    path: str
+    prefix: str
+    suffix: str
+    cwd: str = ""
+
+
+@dataclass
+class SpanCitationState:
+    """Durable per-session span citation records, pending jobs, and notices."""
+
+    records: dict[str, str] = field(default_factory=dict)
+    pending: dict[str, dict[str, Any]] = field(default_factory=dict)
+    notices: dict[str, str] = field(default_factory=dict)
+
+
+def _fork_span_citation_state(value: Any) -> SpanCitationState:
+    if isinstance(value, SpanCitationState):
+        return SpanCitationState(records=dict(value.records))
+    if isinstance(value, dict):
+        return SpanCitationState(records=dict(value.get("records") or {}))
+    return SpanCitationState()
+
+
+SPAN_CITATIONS_DURABLE_SPEC = DurableSpec(
+    name=DURABLE_KEY,
+    cls=SpanCitationState,
+    version=1,
+    on_fork=_fork_span_citation_state,
+)
+
+
+@dataclass
+class SpanCitationRuntime:
+    """Strictly ephemeral per-session tracking for active clip ops and wait timers."""
+
+    active_ops: dict[OpId, str] = field(default_factory=dict)
+    job_ops: dict[str, OpId] = field(default_factory=dict)
+    inline_waits: dict[OpId, tuple[str, OpId, ToolCall]] = field(default_factory=dict)
+    inline_clips: dict[OpId, tuple[OpId, ToolCall]] = field(default_factory=dict)
+    enqueued_notices: set[str] = field(default_factory=set)
+
+
+def span_state(state: State) -> SpanCitationState:
+    """Return the durable ``SpanCitationState`` registered under ``span_citations``."""
+    if hasattr(state, "register_durable_spec") and DURABLE_KEY not in getattr(state, "_durable_specs", {}):
+        state.register_durable_spec(SPAN_CITATIONS_DURABLE_SPEC)
+    return state.durable(DURABLE_KEY, SpanCitationState)
+
+
+def span_runtime(state: State) -> SpanCitationRuntime:
+    """Return the ephemeral per-session ``SpanCitationRuntime`` namespace."""
+    return state.runtime(RUNTIME_KEY, SpanCitationRuntime)
+
+
 def _get_session_cwd(state: State) -> str:
-    cwd = str(
+    return str(
         getattr(state, "cwd", "")
         or getattr(state, "session_cwd", "")
         or getattr(state, "terminal_cwd", "")
         or ""
     ).strip()
-    return cwd or os.getcwd()
 
 
-def _signature(info):
+# ---------------------------------------------------------------------------
+# Disk extraction helpers (executed ONLY inside SpanClipDriver worker threads)
+# ---------------------------------------------------------------------------
+
+
+def _signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _extremes(data, anchor, base, floor, positions, first):
+def _extremes(data: bytes, anchor: bytes, base: int, floor: int, positions: Any, first: bool) -> None:
     """Keep the first/last two occurrences, including overlapping matches."""
     start = max(0, floor - base)
     if first:
@@ -83,10 +162,11 @@ def _extremes(data, anchor, base, floor, positions, first):
         positions.extend(reversed(found))
 
 
-def _scan_snapshot(source, snapshot, prefix, suffix):
+def _scan_snapshot(source: Any, snapshot: Any, prefix: bytes, suffix: bytes) -> tuple[int, int, int, str]:
     digest = hashlib.sha256()
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    starts, ends = [], deque(maxlen=2)
+    starts: list[int] = []
+    ends: deque[int] = deque(maxlen=2)
     tail, total = b"", 0
     overlap = max(len(prefix), len(suffix)) - 1
     floors = [0, 0]
@@ -110,11 +190,11 @@ def _scan_snapshot(source, snapshot, prefix, suffix):
     return starts[0], ends[-1] + len(suffix), total, digest.hexdigest()
 
 
-def extract_citation(path, prefix, suffix, cwd):
+def extract_citation(path: str, prefix: str, suffix: str, cwd: str) -> dict[str, Any]:
     """Read one byte snapshot; never reread the live file to extract its quote."""
     resolved = Path(path).expanduser()
     if not resolved.is_absolute():
-        resolved = Path(cwd) / resolved
+        resolved = (Path(cwd) / resolved) if cwd else resolved
     resolved = resolved.resolve(strict=True)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     with os.fdopen(os.open(resolved, flags), "rb") as source:
@@ -153,7 +233,7 @@ def extract_citation(path, prefix, suffix, cwd):
     }
 
 
-def _worker(path, prefix, suffix, cwd):
+def _worker(path: str, prefix: str, suffix: str, cwd: str) -> dict[str, Any]:
     try:
         return {"status": "complete", "citation_json": encode(extract_citation(path, prefix, suffix, cwd))}
     except ClipError as exc:
@@ -168,75 +248,256 @@ def _worker(path, prefix, suffix, cwd):
     return {"status": "error", "code": code, "message": message}
 
 
-def citation_provider(state, buffer_id):
-    return getattr(state, "span_citation_records", {}).get(buffer_id)
+# ---------------------------------------------------------------------------
+# Runtime IO driver
+# ---------------------------------------------------------------------------
 
 
-def bind_namespace(state):
+class SpanClipDriver(Driver):
+    """Bounded thread-pool driver executing ``ClipSpanRequest`` disk reads."""
+
+    durability = "ephemeral"
+    request_types = (ClipSpanRequest,)
+
+    def __init__(self, *, max_workers: int = MAX_PENDING) -> None:
+        super().__init__()
+        self._max_workers = max(1, int(max_workers))
+        self._lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[OpId, Future[Any]] = {}
+        self._cancelled: set[OpId] = set()
+        self._closed = False
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._lock:
+            self._closed = False
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="span-clip",
+                )
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, ClipSpanRequest):
+            raise TypeError(f"SpanClipDriver expected ClipSpanRequest, got {type(req).__name__}")
+        with self._lock:
+            if self._closed:
+                return
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="span-clip",
+                )
+            fut = self._executor.submit(self._run_op, op_id, req)
+            self._futures[op_id] = fut
+
+    def _run_op(self, op_id: OpId, req: ClipSpanRequest) -> None:
+        with self._lock:
+            if self._closed or op_id in self._cancelled:
+                self._futures.pop(op_id, None)
+                self._cancelled.discard(op_id)
+                return
+        try:
+            result = _worker(req.path, req.prefix, req.suffix, req.cwd)
+        except Exception as exc:
+            with self._lock:
+                self._futures.pop(op_id, None)
+                cancelled = self._closed or op_id in self._cancelled
+                self._cancelled.discard(op_id)
+            if not cancelled:
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
+            return
+        with self._lock:
+            self._futures.pop(op_id, None)
+            cancelled = self._closed or op_id in self._cancelled
+            self._cancelled.discard(op_id)
+        if not cancelled:
+            self._safe_emit(IoCompleted(op_id=op_id, value=result))
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._lock:
+            self._cancelled.add(op_id)
+            fut = self._futures.pop(op_id, None)
+        if fut is not None:
+            fut.cancel()
+
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del policy, deadline
+        with self._lock:
+            active_ops = list(self._futures.items())
+            for op_id, _fut in active_ops:
+                self._cancelled.add(op_id)
+            self._futures.clear()
+        for _op_id, fut in active_ops:
+            fut.cancel()
+        return []
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            active_ops = list(self._futures.items())
+            for op_id, _fut in active_ops:
+                self._cancelled.add(op_id)
+            self._futures.clear()
+            executor = self._executor
+            self._executor = None
+        for _op_id, fut in active_ops:
+            fut.cancel()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O state helpers & special-buffer provider
+# ---------------------------------------------------------------------------
+
+
+def citation_provider(state: State, buffer_id: str) -> str | None:
+    return span_state(state).records.get(buffer_id)
+
+
+def bind_namespace(state: State) -> None:
     state.buffer_manager.register_special_buffer_namespace(PREFIX, citation_provider, replace=True)
 
 
-class ClipService:
-    """Runtime-only futures. Workers never access mutable harness state."""
-    def __init__(self):
-        self.futures = {}
-        self.enqueued = set()
+def _pending_reply(job_id: str) -> dict[str, Any]:
+    return {
+        "status": "pending",
+        "job_id": job_id,
+        "message": "Clipping continues in the background; completion will arrive as an interrupt.",
+    }
 
-    def start(self, job_id, path, prefix, suffix, cwd):
-        future = Future()
-        self.futures[job_id] = future
 
-        def run():
-            future.set_result(_worker(path, prefix, suffix, cwd))
+def _interrupted_result() -> dict[str, Any]:
+    return {
+        "status": "error",
+        "code": "interrupted",
+        "message": "Clip job did not survive backend reload; call clip_span again.",
+    }
 
-        try:
-            threading.Thread(target=run, name=f"clip-{job_id}", daemon=True).start()
-        except Exception:
-            self.futures.pop(job_id, None)
-            raise
-        return future
 
-    def finish(self, state, job_id, result):
-        state.span_citation_pending.pop(job_id, None)
-        self.futures.pop(job_id, None)
-        if result["status"] == "error":
-            return {"job_id": job_id, **result}
-        buffer_id = PREFIX + uuid.uuid4().hex
-        state.span_citation_records[buffer_id] = result["citation_json"]
-        return {"status": "complete", "job_id": job_id, "buffer_id": buffer_id,
-                "readonly": True, "message": "Use view(buffer=...) to read; close_buffer(buffer=...) to release."}
+def _finish_job(state: State, job_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    durable = span_state(state)
+    durable.pending.pop(job_id, None)
+    if result.get("status") == "error":
+        return {"job_id": job_id, **result}
+    buffer_id = PREFIX + uuid.uuid4().hex
+    durable.records[buffer_id] = result["citation_json"]
+    return {
+        "status": "complete",
+        "job_id": job_id,
+        "buffer_id": buffer_id,
+        "readonly": True,
+        "message": "Use view(buffer=...) to read; close_buffer(buffer=...) to release.",
+    }
+
+
+def _format_notice(job_id: str, reply: dict[str, Any]) -> str:
+    return f"[Span clipping completed | {job_id}]\n" + encode(reply)
+
+
+def _normalize_io_result(event: IoCompleted | IoFailed) -> dict[str, Any]:
+    if isinstance(event, IoCompleted) and isinstance(event.value, dict):
+        return event.value
+    if isinstance(event, IoFailed):
+        err = event.error
+        code = getattr(err, "code", "internal_error")
+        message = str(err) if not isinstance(err, BaseException) else f"{type(err).__name__}: {err}"
+        return {"status": "error", "code": code, "message": message}
+    return {"status": "error", "code": "internal_error", "message": "Invalid clip driver result."}
+
+
+def _is_notice_delivered(state: State, job_id: str) -> bool:
+    marker = f"[Span clipping completed | {job_id}]"
+    return any(
+        getattr(entry, "system_generated", False)
+        and any(
+            isinstance(message.get("content"), str) and message["content"].startswith(marker)
+            for message in entry.messages
+        )
+        for entry in getattr(state, "entries", [])
+    )
+
+
+def _reap_orphaned_pending(state: State) -> None:
+    durable = span_state(state)
+    rt = span_runtime(state)
+    for job_id in list(durable.pending):
+        if job_id in rt.job_ops:
+            continue
+        reply = _finish_job(state, job_id, _interrupted_result())
+        durable.notices[job_id] = _format_notice(job_id, reply)
+
+
+def _queue_interrupt_message(state: State, message: str, *, check_name: str = "span_citation_completion") -> None:
+    if not hasattr(state, "pending_interrupts") or state.pending_interrupts is None:
+        state.pending_interrupts = []
+    if not hasattr(state, "_interrupt_state") or state._interrupt_state is None:
+        state._interrupt_state = {}
+    state.pending_interrupts.append(message)
+    state._interrupt_state.setdefault(check_name, {})["last_fired"] = state.step
+
+
+def _flush_notices(state: State, *, fire_fn: Any = None) -> None:
+    durable = span_state(state)
+    rt = span_runtime(state)
+    for job_id, notice in list(durable.notices.items()):
+        if _is_notice_delivered(state, job_id):
+            del durable.notices[job_id]
+            rt.enqueued_notices.discard(job_id)
+        elif job_id not in rt.enqueued_notices:
+            if fire_fn is not None:
+                fire_fn(state, notice)
+            else:
+                _queue_interrupt_message(state, notice)
+            rt.enqueued_notices.add(job_id)
+
+
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O pipeline components
+# ---------------------------------------------------------------------------
 
 
 class SpanSetup:
     handles = (InputReceived, RunToolCall, TurnSettled)
     reads = {"buffer_manager"}
-    writes = {"span_citation_records", "span_citation_pending"}
-    init = {"span_citation_records": dict, "span_citation_pending": dict, "span_citation_notices": dict}
+    writes: set[str] = set()
+    init: dict[str, Any] = {}
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        span_state(state)
         if getattr(state, "buffer_manager", None) is not None:
             bind_namespace(state)
 
 
 class SpanStartup:
-    handles = (SessionReady,)
-    optional_reads = {"buffer_manager"}
-    init = SpanSetup.init
+    handles = (SessionReady, SessionRestored)
+    optional_reads = {"buffer_manager", "entries", "pending_interrupts"}
+    writes: set[str] = set()
+    init: dict[str, Any] = {}
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        span_state(state)
         if getattr(state, "buffer_manager", None) is not None:
             bind_namespace(state)
+        if isinstance(event, SessionRestored):
+            _reap_orphaned_pending(state)
+            _flush_notices(state)
 
 
 class ClipSpan(Tool):
-    reads = {"buffer_manager", "span_citation_records", "span_citation_pending"}
-    writes = {"span_citation_records", "span_citation_pending"}
+    handles = (RunToolCall, IoCompleted, IoFailed, TimerFired, IoInterrupted, InterruptRequested)
+    reads = {"buffer_manager"}
+    writes: set[str] = set()
     optional_reads = {"cwd", "session_cwd", "terminal_cwd"}
     group = "Span citations"
-
-    def __init__(self, service):
-        super().__init__()
-        self.service = service
+    io_tag = "span_citations"
 
     def call(self, state: State, path: str, prefix: str, suffix: str) -> str:
         """Clip an exact, uniquely anchored span from a UTF-8 file into immutable JSON.
@@ -254,10 +515,10 @@ class ClipSpan(Tool):
             prefix: Nonempty exact string at the beginning of the desired span.
             suffix: Nonempty exact string at the end of the desired span.
         """
-        return encode(self.execute(state, path, prefix, suffix))
+        raise NotImplementedError("ClipSpan executes asynchronously via handle()")
 
-    def execute(self, state, path, prefix, suffix):
-        deadline = time.monotonic() + WAIT_SECONDS
+    @staticmethod
+    def _validate(state: State, path: Any, prefix: Any, suffix: Any) -> tuple[str, str, str]:
         if not isinstance(path, str) or not path or "\x00" in path:
             raise ClipError("invalid_path", "path must be a nonempty disk file path.")
         for name, value in (("prefix", prefix), ("suffix", suffix)):
@@ -265,24 +526,46 @@ class ClipSpan(Tool):
                 raise ClipError("invalid_anchor", f"{name} must be a nonempty string.")
             if len(value.encode("utf-8")) > MAX_ANCHOR_BYTES:
                 raise ClipError("invalid_anchor", f"{name} exceeds {MAX_ANCHOR_BYTES} UTF-8 bytes.")
-        if len(state.span_citation_pending) >= MAX_PENDING:
+        if len(span_state(state).pending) >= MAX_PENDING:
             raise ClipError("busy", "Four clip jobs are outstanding; wait for their completion interrupts.")
-        bind_namespace(state)
-        job_id = "clip_" + uuid.uuid4().hex
-        future = self.service.start(job_id, path, prefix, suffix, _get_session_cwd(state))
-        state.span_citation_pending[job_id] = {"path": path}
-        try:
-            result = future.result(timeout=max(0, deadline - time.monotonic()))
-        except TimeoutError:
-            return {"status": "pending", "job_id": job_id,
-                    "message": "Clipping continues in the background; completion will arrive as an interrupt."}
-        return self.service.finish(state, job_id, result)
+        return path, prefix, suffix
+
+    @staticmethod
+    def _complete_tc(tc: ToolCall, reply: dict[str, Any], ts: float, emit: EmitFn) -> None:
+        tc.waiting_op = None
+        tc._owner = None
+        tc.result = encode(reply)
+        tc.error = reply.get("status") == "error"
+        tc.finished_at = ts
+        emit(ToolCallFinished(tc))
+
+    def on_deadline(self, tc: ToolCall, state: State, emit: EmitFn) -> bool:
+        rt = span_runtime(state)
+        clip_op = tc.waiting_op
+        if clip_op is not None and clip_op in rt.inline_clips:
+            timer_op, _ = rt.inline_clips.pop(clip_op)
+            entry = rt.inline_waits.pop(timer_op, None)
+            state.io.cancel(timer_op)
+            job_id = entry[0] if entry is not None else rt.active_ops.get(clip_op, "")
+            self._complete_tc(tc, _pending_reply(job_id), 0.0, emit)
+            return True
+        return super().on_deadline(tc, state, emit)
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        if not isinstance(event, RunToolCall):
-            return
+        if isinstance(event, RunToolCall):
+            self._handle_run_tool_call(event, state, emit)
+        elif isinstance(event, (IoCompleted, IoFailed)):
+            self._handle_io_done(event, state, emit)
+        elif isinstance(event, TimerFired):
+            self._handle_timer_fired(event, state, emit)
+        elif isinstance(event, IoInterrupted):
+            self._handle_io_interrupted(event, state)
+        elif isinstance(event, InterruptRequested):
+            self._handle_interrupt_requested(state)
+
+    def _handle_run_tool_call(self, event: RunToolCall, state: State, emit: EmitFn) -> None:
         tc = event.tool_call
-        if tc.name != self.name:
+        if tc.name != self.name or tc.result is not None:
             return
         event.stop()
         if tc.started_at is None:
@@ -291,72 +574,153 @@ class ClipSpan(Tool):
             tc.result = f"ERROR: {self.name} is not currently available."
             tc.error = True
             tc.finished_at = event.ts
+            tc._owner = None
             emit(ToolCallFinished(tc))
             return
         try:
-            result = self.execute(state, **tc.parsed_args)
+            path, prefix, suffix = self._validate(state, **tc.parsed_args)
         except (ClipError, UnicodeError, TypeError) as exc:
-            result = {"status": "error", "code": getattr(exc, "code", "invalid_params"), "message": str(exc)}
+            reply = {"status": "error", "code": getattr(exc, "code", "invalid_params"), "message": str(exc)}
+            self._complete_tc(tc, reply, event.ts, emit)
+            return
         except Exception as exc:
-            result = {"status": "error", "code": "internal_error", "message": f"{type(exc).__name__}: {exc}"}
-        tc.result = encode(result)
-        tc.error = result["status"] == "error"
-        tc.finished_at = event.ts
+            reply = {"status": "error", "code": "internal_error", "message": f"{type(exc).__name__}: {exc}"}
+            self._complete_tc(tc, reply, event.ts, emit)
+            return
+
+        bind_namespace(state)
+        durable = span_state(state)
+        rt = span_runtime(state)
+        job_id = "clip_" + uuid.uuid4().hex
+        durable.pending[job_id] = {"path": path}
+        clip_op = state.io.submit(
+            ClipSpanRequest(
+                job_id=job_id,
+                path=path,
+                prefix=prefix,
+                suffix=suffix,
+                cwd=_get_session_cwd(state),
+            ),
+            tag="span_citations",
+            meta={"job_id": job_id},
+        )
+        rt.active_ops[clip_op] = job_id
+        rt.job_ops[job_id] = clip_op
+
+        if WAIT_SECONDS <= 0:
+            self._complete_tc(tc, _pending_reply(job_id), event.ts, emit)
+            return
+
+        timer_op = state.io.submit(
+            StartTimer(delay_s=float(WAIT_SECONDS)),
+            tag="span_citations_wait",
+            meta={"job_id": job_id, "clip_op": clip_op},
+        )
+        rt.inline_waits[timer_op] = (job_id, clip_op, tc)
+        rt.inline_clips[clip_op] = (timer_op, tc)
+        tc._owner = self
+        tc.waiting_op = clip_op
+
+    def _handle_io_done(self, event: IoCompleted | IoFailed, state: State, emit: EmitFn) -> None:
+        rt = span_runtime(state)
+        inline = rt.inline_clips.pop(event.op_id, None)
+        if inline is None:
+            return
+        timer_op, tc = inline
+        rt.inline_waits.pop(timer_op, None)
+        state.io.cancel(timer_op)
+        job_id = rt.active_ops.pop(event.op_id, "")
+        if job_id:
+            rt.job_ops.pop(job_id, None)
+        event.stop()
+        if getattr(state, "buffer_manager", None) is not None:
+            bind_namespace(state)
+        reply = _finish_job(state, job_id, _normalize_io_result(event))
+        self._complete_tc(tc, reply, event.ts, emit)
+
+    def _handle_timer_fired(self, event: TimerFired, state: State, emit: EmitFn) -> None:
+        rt = span_runtime(state)
+        wait_entry = rt.inline_waits.pop(event.op_id, None)
+        if wait_entry is None:
+            return
+        job_id, clip_op, tc = wait_entry
+        rt.inline_clips.pop(clip_op, None)
+        event.stop()
+        # Do NOT cancel clip_op: clipping continues in the background and
+        # SpanCompletionCheck handles its later IoCompleted/IoFailed.
+        self._complete_tc(tc, _pending_reply(job_id), event.ts, emit)
+
+    def _handle_io_interrupted(self, event: IoInterrupted, state: State) -> None:
+        rt = span_runtime(state)
+        inline = rt.inline_clips.pop(event.op_id, None)
+        if inline is None:
+            return
+        timer_op, tc = inline
+        rt.inline_waits.pop(timer_op, None)
+        state.io.cancel(timer_op)
+        job_id = rt.active_ops.pop(event.op_id, "")
+        if job_id:
+            rt.job_ops.pop(job_id, None)
+            span_state(state).pending.pop(job_id, None)
+        tc.waiting_op = None
         tc._owner = None
-        emit(ToolCallFinished(tc))
+
+    def _handle_interrupt_requested(self, state: State) -> None:
+        rt = span_runtime(state)
+        durable = span_state(state)
+        for clip_op, (timer_op, _tc) in list(rt.inline_clips.items()):
+            rt.inline_clips.pop(clip_op, None)
+            rt.inline_waits.pop(timer_op, None)
+            state.io.cancel(timer_op)
+            state.io.cancel(clip_op)
+            job_id = rt.active_ops.pop(clip_op, "")
+            if job_id:
+                rt.job_ops.pop(job_id, None)
+                durable.pending.pop(job_id, None)
 
 
 class SpanCompletionCheck(InterruptCheck):
     check_name = "span_citation_completion"
     cooldown = 0
-    handles = (TurnSettled,)
-    optional_reads = {"buffer_manager", "span_citation_pending", "span_citation_records", "entries"}
-    writes = {"span_citation_pending", "span_citation_records", "span_citation_notices"}
-    init = {"span_citation_notices": dict}
-
-    def __init__(self, service):
-        self.service = service
+    handles = (IoCompleted, IoFailed, TurnSettled)
+    optional_reads = {"buffer_manager", "entries"}
+    writes = {"pending_interrupts", "_interrupt_state"}
+    init = {"pending_interrupts": list, "_interrupt_state": dict}
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, (IoCompleted, IoFailed)):
+            rt = span_runtime(state)
+            job_id = rt.active_ops.pop(event.op_id, None)
+            if job_id is None:
+                return
+            rt.job_ops.pop(job_id, None)
+            if getattr(state, "buffer_manager", None) is not None:
+                bind_namespace(state)
+            reply = _finish_job(state, job_id, _normalize_io_result(event))
+            notice = _format_notice(job_id, reply)
+            durable = span_state(state)
+            durable.notices[job_id] = notice
+            if job_id not in rt.enqueued_notices:
+                self._fire(state, notice, emit)
+                rt.enqueued_notices.add(job_id)
+            return
+
         if not isinstance(event, TurnSettled):
             return
         if getattr(state, "buffer_manager", None) is None:
             return
         bind_namespace(state)
-        if not hasattr(state, "span_citation_notices") or state.span_citation_notices is None:
-            state.span_citation_notices = {}
-        for job_id in list(getattr(state, "span_citation_pending", {})):
-            future = self.service.futures.get(job_id)
-            if future is not None and not future.done():
-                continue
-            result = future.result() if future is not None else {
-                "status": "error", "code": "interrupted",
-                "message": "Clip job did not survive backend reload; call clip_span again."}
-            reply = self.service.finish(state, job_id, result)
-            state.span_citation_notices[job_id] = (
-                f"[Span clipping completed | {job_id}]\n" + encode(reply))
-        for job_id, notice in list(state.span_citation_notices.items()):
-            marker = f"[Span clipping completed | {job_id}]"
-            delivered = any(
-                getattr(entry, "system_generated", False)
-                and any(isinstance(message.get("content"), str)
-                        and message["content"].startswith(marker)
-                        for message in entry.messages)
-                for entry in getattr(state, "entries", []))
-            if delivered:
-                del state.span_citation_notices[job_id]
-                self.service.enqueued.discard(job_id)
-            elif job_id not in self.service.enqueued:
-                self._fire(state, notice)
-                self.service.enqueued.add(job_id)
+        _reap_orphaned_pending(state)
+        _flush_notices(state, fire_fn=self._fire)
 
 
 class CloseCitation:
     """Intercept close_buffer calls for span_* citation IDs ahead of CloseBuffer."""
+
     handles = (RunToolCall,)
     name = "close_buffer"
-    reads = {"span_citation_records"}
-    writes = {"span_citation_records"}
+    reads: set[str] = set()
+    writes: set[str] = set()
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if not isinstance(event, RunToolCall):
@@ -371,11 +735,12 @@ class CloseCitation:
         if tc.started_at is None:
             tc.started_at = event.ts
         buffer_id = buffer_id.strip()
-        if buffer_id not in state.span_citation_records:
+        records = span_state(state).records
+        if buffer_id not in records:
             tc.result = f"ERROR: No citation buffer '{buffer_id}'."
             tc.error = True
         else:
-            del state.span_citation_records[buffer_id]
+            del records[buffer_id]
             tc.result = f"Closed citation buffer {buffer_id}."
             tc.error = False
         tc.finished_at = event.ts
@@ -383,10 +748,12 @@ class CloseCitation:
         emit(ToolCallFinished(tc))
 
 
-def register_features(builder, *, session, config):
-    service = ClipService()
+def register_features(builder: Any, *, session: Any, config: Any) -> None:
+    del session, config
     builder.add(Feature(
         name="span_citations",
-        components=[SpanSetup(), SpanStartup(), ClipSpan(service), SpanCompletionCheck(service), CloseCitation()],
-        order=[BufferManagerProvider, {SpanSetup, SpanStartup}, ToolRunner, CloseCitation, CloseBuffer],
+        components=[SpanSetup(), SpanStartup(), ClipSpan(), SpanCompletionCheck(), CloseCitation()],
+        order=[IoFence, BufferManagerProvider, {SpanSetup, SpanStartup}, ToolRunner, CloseCitation, CloseBuffer],
+        drivers=[SpanClipDriver],
+        durable_state=SPAN_CITATIONS_DURABLE_SPEC,
     ))
