@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import codecs
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -11,7 +10,6 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-import threading
 from typing import Any
 import uuid
 
@@ -35,7 +33,7 @@ from agent_utils.core.tool import Tool
 from agent_utils.features.buffers import BufferManagerProvider, CloseBuffer
 from agent_utils.features.core import IoFence, ToolRunner
 from agent_utils.features.interrupts import InterruptCheck
-from agent_utils.runtime.driver import Driver
+from agent_zoo.durability import ThreadPoolDriver, session_context
 from agent_zoo.events import SessionReady
 
 PREFIX = "span_"
@@ -125,6 +123,7 @@ def span_runtime(state: State) -> SpanCitationRuntime:
 def _get_session_cwd(state: State) -> str:
     return str(
         getattr(state, "cwd", "")
+        or session_context(state).workspace_dir
         or getattr(state, "session_cwd", "")
         or getattr(state, "terminal_cwd", "")
         or ""
@@ -253,104 +252,21 @@ def _worker(path: str, prefix: str, suffix: str, cwd: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-class SpanClipDriver(Driver):
+class SpanClipDriver(ThreadPoolDriver):
     """Bounded thread-pool driver executing ``ClipSpanRequest`` disk reads."""
 
     durability = "ephemeral"
     request_types = (ClipSpanRequest,)
+    max_workers = MAX_PENDING
+    worker_prefix = "span-clip"
 
     def __init__(self, *, max_workers: int = MAX_PENDING) -> None:
-        super().__init__()
-        self._max_workers = max(1, int(max_workers))
-        self._lock = threading.Lock()
-        self._executor: ThreadPoolExecutor | None = None
-        self._futures: dict[OpId, Future[Any]] = {}
-        self._cancelled: set[OpId] = set()
-        self._closed = False
+        super().__init__(max_workers=max_workers)
 
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._lock:
-            self._closed = False
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="span-clip",
-                )
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
+    def execute(self, req: IoRequest) -> dict[str, Any]:
         if not isinstance(req, ClipSpanRequest):
             raise TypeError(f"SpanClipDriver expected ClipSpanRequest, got {type(req).__name__}")
-        with self._lock:
-            if self._closed:
-                return
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="span-clip",
-                )
-            fut = self._executor.submit(self._run_op, op_id, req)
-            self._futures[op_id] = fut
-
-    def _run_op(self, op_id: OpId, req: ClipSpanRequest) -> None:
-        with self._lock:
-            if self._closed or op_id in self._cancelled:
-                self._futures.pop(op_id, None)
-                self._cancelled.discard(op_id)
-                return
-        try:
-            result = _worker(req.path, req.prefix, req.suffix, req.cwd)
-        except Exception as exc:
-            with self._lock:
-                self._futures.pop(op_id, None)
-                cancelled = self._closed or op_id in self._cancelled
-                self._cancelled.discard(op_id)
-            if not cancelled:
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-            return
-        with self._lock:
-            self._futures.pop(op_id, None)
-            cancelled = self._closed or op_id in self._cancelled
-            self._cancelled.discard(op_id)
-        if not cancelled:
-            self._safe_emit(IoCompleted(op_id=op_id, value=result))
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._lock:
-            self._cancelled.add(op_id)
-            fut = self._futures.pop(op_id, None)
-        if fut is not None:
-            fut.cancel()
-
-    def quiesce(
-        self,
-        *,
-        policy: str = "terminate",
-        deadline: float | None = None,
-    ) -> list[Event]:
-        del policy, deadline
-        with self._lock:
-            active_ops = list(self._futures.items())
-            for op_id, _fut in active_ops:
-                self._cancelled.add(op_id)
-            self._futures.clear()
-        for _op_id, fut in active_ops:
-            fut.cancel()
-        return []
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            active_ops = list(self._futures.items())
-            for op_id, _fut in active_ops:
-                self._cancelled.add(op_id)
-            self._futures.clear()
-            executor = self._executor
-            self._executor = None
-        for _op_id, fut in active_ops:
-            fut.cancel()
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+        return _worker(req.path, req.prefix, req.suffix, req.cwd)
 
 
 # ---------------------------------------------------------------------------
@@ -748,8 +664,8 @@ class CloseCitation:
         emit(ToolCallFinished(tc))
 
 
-def register_features(builder: Any, *, session: Any, config: Any) -> None:
-    del session, config
+def register_features(builder: Any, *, config: Any) -> None:
+    del config
     builder.add(Feature(
         name="span_citations",
         components=[SpanSetup(), SpanStartup(), ClipSpan(), SpanCompletionCheck(), CloseCitation()],
