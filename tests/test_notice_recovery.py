@@ -99,3 +99,27 @@ def test_checks_only_queue_then_pipeline_delivery():
     assert len(session.state.entries) == 1
     session.step(TurnSettled())
     assert len(session.state.entries) == 1
+
+
+def test_malformed_io_completed_result_returns_error_not_keyerror():
+    session, _runtime, _driver = make_session()
+    state = session.state
+    durable = spans.span_state(state)
+    rt = spans.span_runtime(state)
+    durable.pending["clip_bad"] = {"path": "/example"}
+    op_id = state.io.submit(
+        spans.ClipSpanRequest(job_id="clip_bad", path="/example", prefix="P", suffix="S"),
+        tag="span_citations",
+    )
+    rt.active_ops[op_id] = "clip_bad"
+    rt.job_ops["clip_bad"] = op_id
+    state.io.take_outbox()
+    spans.SpanCompletionCheck().handle(
+        IoCompleted(op_id=op_id, value={"ok": True}),
+        state,
+        _noop_emit,
+    )
+    assert "clip_bad" not in durable.pending
+    assert "clip_bad" in durable.notices
+    assert '"code": "internal_error"' in durable.notices["clip_bad"]
+

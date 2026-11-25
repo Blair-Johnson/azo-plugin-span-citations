@@ -310,7 +310,10 @@ def _format_notice(job_id: str, reply: dict[str, Any]) -> str:
 
 def _normalize_io_result(event: IoCompleted | IoFailed) -> dict[str, Any]:
     if isinstance(event, IoCompleted) and isinstance(event.value, dict):
-        return event.value
+        if event.value.get("status") == "error":
+            return event.value
+        if event.value.get("status") == "complete" and isinstance(event.value.get("citation_json"), str):
+            return event.value
     if isinstance(event, IoFailed):
         err = event.error
         code = getattr(err, "code", "internal_error")
@@ -617,7 +620,7 @@ class SpanCompletionCheck(InterruptCheck):
             return
         bind_namespace(state)
         _reap_orphaned_pending(state)
-        _flush_notices(state, fire_fn=self._fire)
+        _flush_notices(state, fire_fn=lambda s, m: self._fire(s, m, emit))
 
 
 class CloseCitation:
