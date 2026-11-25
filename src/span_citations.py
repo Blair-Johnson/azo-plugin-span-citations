@@ -33,7 +33,7 @@ from agent_utils.core.tool import Tool
 from agent_utils.features.buffers import BufferManagerProvider, CloseBuffer
 from agent_utils.features.core import IoFence, ToolRunner
 from agent_utils.features.interrupts import InterruptCheck
-from agent_zoo.durability import ThreadPoolDriver, session_context
+from agent_zoo.durability import ThreadPoolDriver, session_cwd
 from agent_zoo.events import SessionReady
 
 PREFIX = "span_"
@@ -118,16 +118,6 @@ def span_state(state: State) -> SpanCitationState:
 def span_runtime(state: State) -> SpanCitationRuntime:
     """Return the ephemeral per-session ``SpanCitationRuntime`` namespace."""
     return state.runtime(RUNTIME_KEY, SpanCitationRuntime)
-
-
-def _get_session_cwd(state: State) -> str:
-    return str(
-        getattr(state, "cwd", "")
-        or session_context(state).workspace_dir
-        or getattr(state, "session_cwd", "")
-        or getattr(state, "terminal_cwd", "")
-        or ""
-    ).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +505,7 @@ class ClipSpan(Tool):
                 path=path,
                 prefix=prefix,
                 suffix=suffix,
-                cwd=_get_session_cwd(state),
+                cwd=session_cwd(state),
             ),
             tag="span_citations",
             meta={"job_id": job_id},
