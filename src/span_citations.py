@@ -666,3 +666,188 @@ def register_features(builder: Any, *, config: Any) -> None:
         drivers=[SpanClipDriver],
         durable_state=SPAN_CITATIONS_DURABLE_SPEC,
     ))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Hooks
+# ---------------------------------------------------------------------------
+
+_SIM_LARGE_TEXT = "\n".join(
+    f"line {i:04d}: sample oversized preview content for view tool fuzzing"
+    for i in range(1, 1100)
+) + "\n"
+
+_SIM_SPAN_FILES: dict[str, bytes] = {
+    "/workspace/app.py": b"def greet():\n    return 'hello'\n",
+    "/workspace/notes.txt": b"line 1\nline 2\n",
+    "/workspace/large.txt": _SIM_LARGE_TEXT.encode("utf-8"),
+}
+
+
+def _sim_extract_citation(req: ClipSpanRequest) -> dict[str, Any]:
+    """Pure in-memory deterministic span extraction mirroring ``SpanClipDriver``."""
+    import io
+    import posixpath
+
+    raw_path = str(req.path or "")
+    if raw_path.startswith("/"):
+        resolved = posixpath.normpath(raw_path)
+    else:
+        resolved = posixpath.normpath(posixpath.join(req.cwd or "/workspace", raw_path))
+    data = _SIM_SPAN_FILES.get(resolved)
+    if data is None:
+        return {"status": "error", "code": "io_error", "message": f"No such file: {resolved}"}
+
+    try:
+        source = io.BytesIO(data)
+        snapshot = io.BytesIO()
+        start, end, size, digest = _scan_snapshot(
+            source,
+            snapshot,
+            req.prefix.encode("utf-8"),
+            req.suffix.encode("utf-8"),
+        )
+        if end - start > MAX_SPAN_BYTES:
+            raise ClipError("span_too_large", f"Span exceeds {MAX_SPAN_BYTES} bytes; narrow the anchors.")
+        head = data[:start].decode("utf-8")
+        text = data[start:end].decode("utf-8")
+        char_start = len(head)
+        line_start = 1 + head.count("\n")
+        citation = {
+            "schema": "azo.span-citation",
+            "version": 1,
+            "file": {
+                "path": resolved,
+                "encoding": "utf-8",
+                "size_bytes": size,
+                "hash": {"algorithm": "sha256", "hex": digest},
+            },
+            "match": {
+                "mode": "exact",
+                "prefix": req.prefix,
+                "suffix": req.suffix,
+                "anchors_included": True,
+            },
+            "span": {
+                "text": text,
+                "byte_start": start,
+                "byte_end": end,
+                "char_start": char_start,
+                "char_end": char_start + len(text),
+                "line_start": line_start,
+                "line_end": line_start + text[:-1].count("\n"),
+            },
+        }
+        return {"status": "complete", "citation_json": encode(citation)}
+    except ClipError as exc:
+        return {"status": "error", "code": exc.code, "message": str(exc)}
+    except UnicodeError:
+        return {"status": "error", "code": "invalid_utf8", "message": "File and anchors must be valid UTF-8 text."}
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register deterministic in-memory simulation handlers for ``ClipSpanRequest``."""
+    from agent_utils.runtime.simulation import SimOutcome
+
+    def _handle_clip_span(_op_id: OpId, req: ClipSpanRequest, _sim: Any) -> SimOutcome:
+        # Exercise both fast inline completion (< WAIT_SECONDS) and background
+        # pending completion (> WAIT_SECONDS -> TimerFired + SpanCompletionCheck).
+        if rng.random() < 0.65:
+            delay = rng.uniform(0.02, 0.25)
+        else:
+            delay = rng.uniform(WAIT_SECONDS + 0.05, WAIT_SECONDS + 0.35)
+
+        roll = rng.random()
+        if roll < 0.05:
+            return SimOutcome(error=OSError("simulated clip read failure"), delay=delay)
+        if roll < 0.10:
+            return SimOutcome(
+                value={
+                    "status": "error",
+                    "code": "file_changed",
+                    "message": "File changed while reading; retry against a stable file.",
+                },
+                delay=delay,
+            )
+        return SimOutcome(value=_sim_extract_citation(req), delay=delay)
+
+    import sys as _sys
+
+    sim.register_handler(ClipSpanRequest, _handle_clip_span)
+    live_cls = getattr(_sys.modules.get(__name__), "ClipSpanRequest", None)
+    if isinstance(live_cls, type) and live_cls is not ClipSpanRequest:
+        sim.register_handler(live_cls, _handle_clip_span)
+
+
+def fuzz_tool_args(tool_name: str, rng: Any, state: State) -> dict[str, Any] | None:
+    """Generate deterministic valid and edge-case arguments for ``clip_span``."""
+    del state
+    if tool_name != "clip_span":
+        return None
+    roll = rng.random()
+    if roll < 0.80:
+        path, prefix, suffix = rng.choice(
+            [
+                ("/workspace/app.py", "def greet():", "return 'hello'"),
+                ("app.py", "def ", "'hello'"),
+                ("/workspace/notes.txt", "line 1", "line 2"),
+                ("/workspace/large.txt", "line 0001:", "line 0003:"),
+                ("/workspace/large.txt", "line 0010:", "line 0012:"),
+            ]
+        )
+        return {"path": path, "prefix": prefix, "suffix": suffix}
+    if roll < 0.90:
+        path, prefix, suffix = rng.choice(
+            [
+                ("/workspace/notes.txt", "line", "line"),
+                ("/workspace/app.py", "missing_prefix", "missing_suffix"),
+            ]
+        )
+        return {"path": path, "prefix": prefix, "suffix": suffix}
+    return {"path": "/workspace/missing.txt", "prefix": "start", "suffix": "end"}
+
+
+def check_invariants(session: Any) -> None:
+    """Verify durable and ephemeral invariants for span citation state."""
+    state = session.state
+    durable = state.features.get(DURABLE_KEY)
+    is_durable = isinstance(durable, SpanCitationState) or type(durable).__name__ == "SpanCitationState"
+    if is_durable:
+        assert isinstance(durable.records, dict)
+        assert isinstance(durable.pending, dict)
+        assert isinstance(durable.notices, dict)
+        assert len(durable.pending) <= MAX_PENDING, (
+            f"pending clip jobs exceeded MAX_PENDING ({len(durable.pending)} > {MAX_PENDING})"
+        )
+        for bid, raw in durable.records.items():
+            assert isinstance(bid, str) and bid.startswith(PREFIX), (
+                f"invalid citation buffer id: {bid!r}"
+            )
+            assert isinstance(raw, str) and raw
+            parsed = json.loads(raw)
+            assert parsed.get("schema") == "azo.span-citation" and parsed.get("version") == 1
+        for jid, notice in durable.notices.items():
+            assert isinstance(jid, str) and jid
+            assert isinstance(notice, str) and notice.startswith(f"[Span clipping completed | {jid}]")
+            assert jid not in durable.pending, (
+                f"job {jid!r} present in both durable.pending and durable.notices"
+            )
+
+    rt = state.runtime(RUNTIME_KEY) if callable(getattr(state, "runtime", None)) else None
+    if isinstance(rt, SpanCitationRuntime) or type(rt).__name__ == "SpanCitationRuntime":
+        assert len(rt.active_ops) == len(rt.job_ops), (
+            f"active_ops/job_ops mismatch: {len(rt.active_ops)} != {len(rt.job_ops)}"
+        )
+        for op_id, jid in rt.active_ops.items():
+            assert rt.job_ops.get(jid) == op_id, (
+                f"job_ops bijection broken for {jid!r}: {rt.job_ops.get(jid)!r} != {op_id!r}"
+            )
+            if is_durable:
+                assert jid in durable.pending, f"active job {jid!r} missing from durable.pending"
+        for clip_op, (timer_op, _tc) in rt.inline_clips.items():
+            assert clip_op in rt.active_ops, f"inline_clips op {clip_op!r} missing from active_ops"
+            assert timer_op in rt.inline_waits, f"inline_clips timer {timer_op!r} missing from inline_waits"
+            assert rt.inline_waits[timer_op][1] == clip_op
+        for timer_op, (_jid, clip_op, _tc) in rt.inline_waits.items():
+            assert clip_op in rt.inline_clips, f"inline_waits clip {clip_op!r} missing from inline_clips"
+            assert rt.inline_clips[clip_op][0] == timer_op
